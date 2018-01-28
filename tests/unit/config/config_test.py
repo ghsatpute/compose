@@ -33,6 +33,7 @@ from compose.const import COMPOSEFILE_V3_0 as V3_0
 from compose.const import COMPOSEFILE_V3_1 as V3_1
 from compose.const import COMPOSEFILE_V3_2 as V3_2
 from compose.const import COMPOSEFILE_V3_3 as V3_3
+from compose.const import COMPOSEFILE_V3_5 as V3_5
 from compose.const import IS_WINDOWS_PLATFORM
 from tests import mock
 from tests import unittest
@@ -563,7 +564,7 @@ class ConfigTest(unittest.TestCase):
                 'services': {
                     'web': {
                         'build': {
-                            'context': '.',
+                            'context': os.getcwd(),
                             'args': None,
                         },
                     },
@@ -959,7 +960,7 @@ class ConfigTest(unittest.TestCase):
         ).services[0]
         assert 'labels' in service['build']
         assert 'label1' in service['build']['labels']
-        assert service['build']['labels']['label1'] == 42
+        assert service['build']['labels']['label1'] == '42'
         assert service['build']['labels']['label2'] == 'foobar'
 
     def test_load_build_labels_list(self):
@@ -2300,37 +2301,96 @@ class ConfigTest(unittest.TestCase):
 
     def test_merge_deploy_override(self):
         base = {
-            'image': 'busybox',
             'deploy': {
-                'mode': 'global',
-                'restart_policy': {
-                    'condition': 'on-failure'
-                },
+                'endpoint_mode': 'vip',
+                'labels': ['com.docker.compose.a=1', 'com.docker.compose.b=2'],
+                'mode': 'replicated',
                 'placement': {
                     'constraints': [
-                        'node.role == manager'
+                        'node.role == manager', 'engine.labels.aws == true'
+                    ],
+                    'preferences': [
+                        {'spread': 'node.labels.zone'}, {'spread': 'x.d.z'}
                     ]
-                }
-            }
+                },
+                'replicas': 3,
+                'resources': {
+                    'limits': {'cpus': '0.50', 'memory': '50m'},
+                    'reservations': {
+                        'cpus': '0.1',
+                        'generic_resources': [
+                            {'discrete_resource_spec': {'kind': 'abc', 'value': 123}}
+                        ],
+                        'memory': '15m'
+                    }
+                },
+                'restart_policy': {'condition': 'any', 'delay': '10s'},
+                'update_config': {'delay': '10s', 'max_failure_ratio': 0.3}
+            },
+            'image': 'hello-world'
         }
         override = {
             'deploy': {
-                'mode': 'replicated',
-                'restart_policy': {
-                    'condition': 'any'
-                }
+                'labels': {
+                    'com.docker.compose.b': '21', 'com.docker.compose.c': '3'
+                },
+                'placement': {
+                    'constraints': ['node.role == worker', 'engine.labels.dev == true'],
+                    'preferences': [{'spread': 'node.labels.zone'}, {'spread': 'x.d.s'}]
+                },
+                'resources': {
+                    'limits': {'memory': '200m'},
+                    'reservations': {
+                        'cpus': '0.78',
+                        'generic_resources': [
+                            {'discrete_resource_spec': {'kind': 'abc', 'value': 134}},
+                            {'discrete_resource_spec': {'kind': 'xyz', 'value': 0.1}}
+                        ]
+                    }
+                },
+                'restart_policy': {'condition': 'on-failure', 'max_attempts': 42},
+                'update_config': {'max_failure_ratio': 0.712, 'parallelism': 4}
             }
         }
-        actual = config.merge_service_dicts(base, override, V3_0)
+        actual = config.merge_service_dicts(base, override, V3_5)
         assert actual['deploy'] == {
             'mode': 'replicated',
-            'restart_policy': {
-                'condition': 'any'
+            'endpoint_mode': 'vip',
+            'labels': {
+                'com.docker.compose.a': '1',
+                'com.docker.compose.b': '21',
+                'com.docker.compose.c': '3'
             },
             'placement': {
                 'constraints': [
-                    'node.role == manager'
+                    'engine.labels.aws == true', 'engine.labels.dev == true',
+                    'node.role == manager', 'node.role == worker'
+                ],
+                'preferences': [
+                    {'spread': 'node.labels.zone'}, {'spread': 'x.d.s'}, {'spread': 'x.d.z'}
                 ]
+            },
+            'replicas': 3,
+            'resources': {
+                'limits': {'cpus': '0.50', 'memory': '200m'},
+                'reservations': {
+                    'cpus': '0.78',
+                    'memory': '15m',
+                    'generic_resources': [
+                        {'discrete_resource_spec': {'kind': 'abc', 'value': 134}},
+                        {'discrete_resource_spec': {'kind': 'xyz', 'value': 0.1}},
+                    ]
+                }
+            },
+            'restart_policy': {
+                'condition': 'on-failure',
+                'delay': '10s',
+                'max_attempts': 42,
+            },
+            'update_config': {
+                'max_failure_ratio': 0.712,
+                'delay': '10s',
+                'parallelism': 4
             }
         }
 
@@ -2747,6 +2807,62 @@ class ConfigTest(unittest.TestCase):
         ]
         assert service_sort(service_dicts) == service_sort(expected)
 
+    def test_config_convertible_label_types(self):
+        config_details = build_config_details(
+            {
+                'version': '3.5',
+                'services': {
+                    'web': {
+                        'build': {
+                            'labels': {'testbuild': True},
+                            'context': os.getcwd()
+                        },
+                        'labels': {
+                            "key": 12345
+                        }
+                    },
+                },
+                'networks': {
+                    'foo': {
+                        'labels': {'network.ips.max': 1023}
+                    }
+                },
+                'volumes': {
+                    'foo': {
+                        'labels': {'volume.is_readonly': False}
+                    }
+                },
+                'secrets': {
+                    'foo': {
+                        'labels': {'secret.data.expires': 1546282120}
+                    }
+                },
+                'configs': {
+                    'foo': {
+                        'labels': {'config.data.correction.value': -0.1412}
+                    }
+                }
+            }
+        )
+        loaded_config = config.load(config_details)
+
+        assert loaded_config.services[0]['build']['labels'] == {'testbuild': 'True'}
+        assert loaded_config.services[0]['labels'] == {'key': '12345'}
+        assert loaded_config.networks['foo']['labels']['network.ips.max'] == '1023'
+        assert loaded_config.volumes['foo']['labels']['volume.is_readonly'] == 'False'
+        assert loaded_config.secrets['foo']['labels']['secret.data.expires'] == '1546282120'
+        assert loaded_config.configs['foo']['labels']['config.data.correction.value'] == '-0.1412'
+
+    def test_config_invalid_label_types(self):
+        config_details = build_config_details({
+            'version': '2.3',
+            'volumes': {
+                'foo': {'labels': [1, 2, 3]}
+            }
+        })
+        with pytest.raises(ConfigurationError):
+            config.load(config_details)
+
     def test_service_volume_invalid_config(self):
         config_details = build_config_details(
             {
@@ -2766,13 +2882,30 @@ class ConfigTest(unittest.TestCase):
                                 }
                             }
                         ]
-                    },
-                },
+                    }
+                }
             }
         )
         with pytest.raises(ConfigurationError) as exc:
             config.load(config_details)
+
         assert "services.web.volumes contains unsupported option: 'garbage'" in exc.exconly()
+
+    def test_config_valid_service_label_validation(self):
+        config_details = build_config_details(
+            {
+                'version': '3.5',
+                'services': {
+                    'web': {
+                        'image': 'busybox',
+                        'labels': {
+                            "key": "string"
+                        }
+                    },
+                },
+            }
+        )
+        config.load(config_details)
 
 
 class NetworkModeTest(unittest.TestCase):

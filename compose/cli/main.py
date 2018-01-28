@@ -233,7 +233,7 @@ class TopLevelCommand(object):
             --force-rm              Always remove intermediate containers.
             --no-cache              Do not use cache when building the image.
             --pull                  Always attempt to pull a newer version of the image.
-            -m, --memory MEM        Sets memory limit for the bulid container.
+            -m, --memory MEM        Sets memory limit for the build container.
             --build-arg key=val     Set build-time variables for one service.
         """
         service_names = options['SERVICE']
@@ -434,6 +434,8 @@ class TopLevelCommand(object):
             -e, --env KEY=VAL Set environment variables (can be used multiple times,
                               not supported in API < 1.25)
         """
+        environment = Environment.from_env_file(self.project_dir)
+        use_cli = not environment.get_boolean('COMPOSE_INTERACTIVE_NO_CLI')
         index = int(options.get('--index'))
         service = self.project.get_service(options['SERVICE'])
         detach = options['-d']
@@ -448,14 +450,14 @@ class TopLevelCommand(object):
         command = [options['COMMAND']] + options['ARGS']
         tty = not options["-T"]
 
-        if IS_WINDOWS_PLATFORM and not detach:
+        if IS_WINDOWS_PLATFORM or use_cli and not detach:
             sys.exit(call_docker(build_exec_command(options, container.id, command)))
 
         create_exec_options = {
             "privileged": options["--privileged"],
             "user": options["--user"],
             "tty": tty,
-            "stdin": tty,
+            "stdin": True,
         }
 
         if docker.utils.version_gte(self.project.client.api_version, '1.25'):
@@ -619,7 +621,7 @@ class TopLevelCommand(object):
         """
         List containers.
 
-        Usage: ps [options] [--filter KEY=VAL] [SERVICE...]
+        Usage: ps [options] [SERVICE...]
 
         Options:
             -q                   Only display IDs
@@ -792,7 +794,7 @@ class TopLevelCommand(object):
             command = service.options.get('command')
 
         container_options = build_container_options(options, detach, command)
-        run_one_off_container(container_options, self.project, service, options)
+        run_one_off_container(container_options, self.project, service, options, self.project_dir)
 
     def scale(self, options):
         """
@@ -934,7 +936,7 @@ class TopLevelCommand(object):
             --always-recreate-deps     Recreate dependent containers.
                                        Incompatible with --no-recreate.
             --no-recreate              If containers already exist, don't recreate
-                                       them. Incompatible with --force-recreate.
+                                       them. Incompatible with --force-recreate and -V.
             --no-build                 Don't build an image, even if it's missing.
             --no-start                 Don't start the services after creating them.
             --build                    Build images before starting containers.
@@ -943,8 +945,10 @@ class TopLevelCommand(object):
             -t, --timeout TIMEOUT      Use this timeout in seconds for container
                                        shutdown when attached or when containers are
                                        already running. (default: 10)
-            --remove-orphans           Remove containers for services not
-                                       defined in the Compose file
+            -V, --renew-anon-volumes   Recreate anonymous volumes instead of retrieving
+                                       data from the previous containers.
+            --remove-orphans           Remove containers for services not defined
+                                       in the Compose file.
             --exit-code-from SERVICE   Return the exit code of the selected service
                                        container. Implies --abort-on-container-exit.
             --scale SERVICE=NUM        Scale SERVICE to NUM instances. Overrides the
@@ -969,25 +973,43 @@ class TopLevelCommand(object):
         if ignore_orphans and remove_orphans:
             raise UserError("COMPOSE_IGNORE_ORPHANS and --remove-orphans cannot be combined.")
 
-        if no_start:
-            for excluded in ['-d', '--abort-on-container-exit', '--exit-code-from']:
-                if options.get(excluded):
-                    raise UserError('--no-start and {} cannot be combined.'.format(excluded))
+        opts = ['-d', '--abort-on-container-exit', '--exit-code-from']
+        for excluded in [x for x in opts if options.get(x) and no_start]:
+            raise UserError('--no-start and {} cannot be combined.'.format(excluded))
 
         with up_shutdown_context(self.project, service_names, timeout, detached):
-            to_attach = self.project.up(
-                service_names=service_names,
-                start_deps=start_deps,
-                strategy=convergence_strategy_from_opts(options),
-                do_build=build_action_from_opts(options),
-                timeout=timeout,
-                detached=detached,
-                remove_orphans=remove_orphans,
-                ignore_orphans=ignore_orphans,
-                scale_override=parse_scale_args(options['--scale']),
-                start=not no_start,
-                always_recreate_deps=always_recreate_deps
-            )
+            warn_for_swarm_mode(self.project.client)
+
+            def up(rebuild):
+                return self.project.up(
+                    service_names=service_names,
+                    start_deps=start_deps,
+                    strategy=convergence_strategy_from_opts(options),
+                    do_build=build_action_from_opts(options),
+                    timeout=timeout,
+                    detached=detached,
+                    remove_orphans=remove_orphans,
+                    ignore_orphans=ignore_orphans,
+                    scale_override=parse_scale_args(options['--scale']),
+                    start=not no_start,
+                    always_recreate_deps=always_recreate_deps,
+                    reset_container_image=rebuild,
+                    renew_anonymous_volumes=options.get('--renew-anon-volumes')
+                )
+
+            try:
+                to_attach = up(False)
+            except docker.errors.ImageNotFound as e:
+                log.error(
+                    "The image for the service you're trying to recreate has been removed. "
+                    "If you continue, volume data could be lost. Consider backing up your data "
+                    "before continuing.\n".format(e.explanation)
+                )
+                res = yesno("Continue with the new image? [yN]", False)
+                if res is None or not res:
+                    raise e
+
+                to_attach = up(True)
 
             if detached or no_start:
                 return
@@ -1064,10 +1086,14 @@ def compute_exit_code(exit_value_from, attached_containers, cascade_starter, all
 def convergence_strategy_from_opts(options):
     no_recreate = options['--no-recreate']
     force_recreate = options['--force-recreate']
+    renew_anonymous_volumes = options.get('--renew-anon-volumes')
     if force_recreate and no_recreate:
         raise UserError("--force-recreate and --no-recreate cannot be combined.")
 
-    if force_recreate:
+    if no_recreate and renew_anonymous_volumes:
+        raise UserError('--no-recreate and --renew-anon-volumes cannot be combined.')
+
+    if force_recreate or renew_anonymous_volumes:
         return ConvergenceStrategy.always
 
     if no_recreate:
@@ -1206,7 +1232,7 @@ def _build_container_entrypoint_options(container_options, options):
         container_options['entrypoint'] = options.get('--entrypoint')
 
 
-def run_one_off_container(container_options, project, service, options):
+def run_one_off_container(container_options, project, service, options, project_dir='.'):
     if not options['--no-deps']:
         deps = service.get_dependency_names()
         if deps:
@@ -1233,10 +1259,13 @@ def run_one_off_container(container_options, project, service, options):
         if options['--rm']:
             project.client.remove_container(container.id, force=True, v=True)
 
+    environment = Environment.from_env_file(project_dir)
+    use_cli = not environment.get_boolean('COMPOSE_INTERACTIVE_NO_CLI')
+
     signals.set_signal_handler_to_shutdown()
     try:
         try:
-            if IS_WINDOWS_PLATFORM:
+            if IS_WINDOWS_PLATFORM or use_cli:
                 service.connect_container_to_networks(container)
                 exit_code = call_docker(["start", "--attach", "--interactive", container.id])
             else:
@@ -1414,3 +1443,19 @@ def build_filter(arg):
         key, val = arg.split('=', 1)
         filt[key] = val
     return filt
+
+
+def warn_for_swarm_mode(client):
+    info = client.info()
+    if info.get('Swarm', {}).get('LocalNodeState') == 'active':
+        if info.get('ServerVersion', '').startswith('ucp'):
+            # UCP does multi-node scheduling with traditional Compose files.
+            return
+
+        log.warn(
+            "The Docker Engine you're using is running in swarm mode.\n\n"
+            "Compose does not use swarm mode to deploy services to multiple nodes in a swarm. "
+            "All containers will be scheduled on the current node.\n\n"
+            "To deploy your application across the swarm, "
+            "use `docker stack deploy`.\n"
+        )

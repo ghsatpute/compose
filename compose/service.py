@@ -409,7 +409,8 @@ class Service(object):
 
             return containers
 
-    def _execute_convergence_recreate(self, containers, scale, timeout, detached, start):
+    def _execute_convergence_recreate(self, containers, scale, timeout, detached, start,
+                                      renew_anonymous_volumes):
             if scale is not None and len(containers) > scale:
                 self._downscale(containers[scale:], timeout)
                 containers = containers[:scale]
@@ -417,7 +418,7 @@ class Service(object):
             def recreate(container):
                 return self.recreate_container(
                     container, timeout=timeout, attach_logs=not detached,
-                    start_new_container=start
+                    start_new_container=start, renew_anonymous_volumes=renew_anonymous_volumes
                 )
             containers, errors = parallel_execute(
                 containers,
@@ -468,7 +469,9 @@ class Service(object):
         )
 
     def execute_convergence_plan(self, plan, timeout=None, detached=False,
-                                 start=True, scale_override=None, rescale=True, project_services=None):
+                                 start=True, scale_override=None,
+                                 rescale=True, project_services=None,
+                                 reset_container_image=False, renew_anonymous_volumes=False):
         (action, containers) = plan
         scale = scale_override if scale_override is not None else self.scale_num
         containers = sorted(containers, key=attrgetter('number'))
@@ -486,8 +489,15 @@ class Service(object):
             scale = None
 
         if action == 'recreate':
+            if reset_container_image:
+                # Updating the image ID on the container object lets us recover old volumes if
+                # the new image uses them as well
+                img_id = self.image()['Id']
+                for c in containers:
+                    c.reset_image(img_id)
             return self._execute_convergence_recreate(
-                containers, scale, timeout, detached, start
+                containers, scale, timeout, detached, start,
+                renew_anonymous_volumes,
             )
 
         if action == 'start':
@@ -507,12 +517,8 @@ class Service(object):
 
         raise Exception("Invalid action: {}".format(action))
 
-    def recreate_container(
-            self,
-            container,
-            timeout=None,
-            attach_logs=False,
-            start_new_container=True):
+    def recreate_container(self, container, timeout=None, attach_logs=False, start_new_container=True,
+                           renew_anonymous_volumes=False):
         """Recreate a container.
 
         The original container is renamed to a temporary name so that data
@@ -523,7 +529,7 @@ class Service(object):
         container.stop(timeout=self.stop_timeout(timeout))
         container.rename_to_tmp_name()
         new_container = self.create_container(
-            previous_container=container,
+            previous_container=container if not renew_anonymous_volumes else None,
             number=container.labels.get(LABEL_CONTAINER_NUMBER),
             quiet=True,
         )
@@ -1359,7 +1365,7 @@ def get_container_data_volumes(container, volumes_option, tmpfs_option, mounts_o
             continue
 
         ctnr_mount = container_mounts.get(mount.target)
-        if not ctnr_mount.get('Name'):
+        if not ctnr_mount or not ctnr_mount.get('Name'):
             continue
 
         mount.source = ctnr_mount['Name']
